@@ -1,25 +1,29 @@
-import { Injectable } from '@nestjs/common';
-import { envs } from 'src/config';
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { envs, NATS_SERVICE } from 'src/config';
 import Stripe from 'stripe';
 import { PaymentSessionDto } from './dto/payment-session.dto';
 import { Request, Response } from 'express';
+import { ClientProxy } from '@nestjs/microservices';
 
 @Injectable()
 export class PaymentsService {
   private readonly stripe = new Stripe(envs.stripeSecret);
+  private readonly logger = new Logger('PaymentsService');
+
+  constructor(@Inject(NATS_SERVICE) private readonly client: ClientProxy) {}
 
   async createPaymentSession(paymentSessionDto: PaymentSessionDto) {
     const { currency, items, orderId } = paymentSessionDto;
-    const lineItems = items.map((items) => {
+    const lineItems = items.map((item) => {
       return {
         price_data: {
-          currency,
+          currency: currency,
           product_data: {
-            name: items.name,
+            name: item.name,
           },
-          unit_amount: Math.round(items.price * 100),
+          unit_amount: Math.round(item.price * 100),
         },
-        quantity: items.quantity,
+        quantity: item.quantity,
       };
     });
     const session = await this.stripe.checkout.sessions.create({
@@ -35,7 +39,11 @@ export class PaymentsService {
       cancel_url: envs.stripeCancellUrl,
     });
 
-    return session;
+    return {
+      cancelUrl: session.cancel_url,
+      successUrl: session.success_url,
+      paymentUrl: session.url,
+    };
   }
 
   async stripeWebhook(req: Request, res: Response) {
@@ -60,12 +68,15 @@ export class PaymentsService {
     }
     switch (event.type) {
       case 'charge.succeeded':
-        const chargeSucceded = event.data.object;
-        // TODO:
-        console.log({
-          metadata: chargeSucceded.metadata,
-          orderId: chargeSucceded.metadata.orderId,
-        });
+        const chargeSucceeded = event.data.object;
+        const payload = {
+          stripePaymentId: chargeSucceeded.id,
+          orderId: chargeSucceeded.metadata.orderId,
+          receiptUrl: chargeSucceeded.receipt_url,
+        };
+
+        // this.logger.log({ payload });
+        this.client.emit('payment.succeeded', payload);
         break;
 
       default:
